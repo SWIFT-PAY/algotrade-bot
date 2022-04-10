@@ -1,25 +1,6 @@
 # Algorand Trading Bot
 
-> Simple automated bot for executing trades on supported DEXs that allow swaps between supported Algo/ASA trading pairs.
-
-## Disclaimer
-
-I started developing this bot because I wanted to automate trades of the Algo/ASA cryptocurrency tokens I hold as part of my business assets. After some consideration I've decided to build it in the open. Any and ALL use of this bot may involve various risks, including, but not limited to, losses during an automated swap due to the fluctuation of prices of tokens in a trading pair. Before using this bot, you should review it's code and any accompanying documentation to understand how the bot works.
-
-No part of this repository is intended to provide or suggest any financial advice, strategy or any promise that use of the code within this repository will guarantee any financial gain. This project is for educational purposes and demonstrates what is possible in the world of decentralized finance (DeFi) and decentralized trading. Should you choose to make use of this bot, remember that you are responsible for doing your due diligence on the risks involved.
-
-## License
-
-This bot is licensed under the [Apache License 2.0](https://github.com/bajetech/algotrade-bot/blob/main/LICENSE). Please be guided accordingly.
-
-## Purpose
-
-This is a simple bot, written in Python 3, that allows price points to be configured for the bot to send trading requests to supported DEXs to swap between any supported Algo/ASA trading pair.
-
-**The supported pairs are:**
-
-- Algo/USDt
-- Algo/USDC
+This is A Trading Bot That Allows swapping an asset to another at a set price. It stores list of trades in a mongo db.
 
 At the moment this bot integrates with the following DEXs:
 
@@ -50,16 +31,38 @@ The `tinyman-py-sdk` package is also needed but it is not yet released on PYPI. 
 
 `pip install git+https://github.com/tinymanorg/tinyman-py-sdk.git`
 
+Mongo DB has to be installed on your system, this stores the trades and assets. click here https://www.mongodb.com/try/download/community To install Mongo DB for Your OS.
+
 ## Off-chain DB
 
-This bot is implemented to make use of an off-chain MariaDB database that currently contains two tables:
+This bot is implemented to make use of an off-chain MongoDB database that currently contains two tables:
 
 - The `assets` table holds token identification details of the Algorand native token and Algorand Standard Assets (ASAs) that can be traded with the bot.
 - The `trades` table is where the bot looks for trade requests you want performed on behalf of your Algorand wallet.
 
-Schema definitions for these tables can be found in the file [db/schema.sql](./db/schema.sql).
+Schema definitions for these tables can be found in the file [db/models.py](./db/models.py).
 
-The file [db/init.sql](./db/init.sql) contains SQL statements to initialize the `assets` table with the details of the tokens supported so far by this bot. Details for the tokens on both Algorand's testnet and mainnet are included. Support for additional tokens can easily be integrated of course by adding their details to this table. However there MUST be liquidity pools available for any token pairs that you want to set up trades for on the DEXs that this bot integrates with.
+To Create An Asset and Trade, Visit the [populate.py](./populate.py) File For Code Samples.
+
+## Model Schema Definition
+
+```
+class Asset:
+    name: "name of the asset"
+    asset_id: "asa id e.g(0) for Algorand"
+    network: "mainnet" or "testnet"
+
+class Trade:
+    wallet_address: "Algorand Wallet Address of The Trade Executor"
+    asset1: Asset object (e.g Asset(name="Algorand"))
+    asset2: Asset objects
+    asset_in: Asset To swap
+    asset_in_amt: Amount of Asset In To Swap
+    slippage: TinyMan Slippage
+    min_sell_price: Minimum Price to sell Asset for e.g (Sell choice for Algo for at least 0.003 Algo Per choice)
+    do_redeem: Boolean for redeeming excess assets
+    network: "mainnet" or "testnet"
+```
 
 ## Environment Variables
 
@@ -67,6 +70,21 @@ There are environment variables that need to be properly configured for the bot 
 
 ## Launching the bot (to run every X seconds)
 
-There are multiple ways that one can go about setting up a bot to run every some number of seconds. Since I wanted to keep this simple I decided to go the route of using the python Time module to keep the bot running indefinitely so all you need to do is run the appropriate python script (`bot-mainnet.py` for Algorand mainnet, `bot-testnet.py` for Algorand testnet).
+To Run the bot, edit the `Bot` object in the [main.py](./main.py) file and run `python main.py`.
 
-By default the bot will run in _5 second intervals_. To customise this interval change the `bot_interval` .env variable to the desired number of seconds.
+### Sample Code To Run Bot
+```
+import os
+from bot import Bot, Account
+from algosdk import mnemonic
+from dotenv import load_dotenv
+load_dotenv()
+
+address = os.getenv("ADDRESS") #Address In ENV File
+key = mnemonic.to_private_key(os.getenv("KEY")) #Mnemonic In ENV File
+
+account = Account(address, key)
+bot = Bot(account, "mainnet", 5) #Run Bot On MainNet With 5 seconds interval
+bot.run()
+```
+

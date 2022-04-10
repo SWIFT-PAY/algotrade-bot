@@ -1,164 +1,112 @@
-import os
-import sys
+from dataclasses import dataclass
 import time
-from algosdk import mnemonic
-import mariadb
 from tinyman.v1.client import TinymanTestnetClient, TinymanMainnetClient
-from utils import get_db_connection, Account, get_supported_algo_assets
-from dotenv import load_dotenv
-load_dotenv()
+from utils import get_trades
+from colorama import Fore
 
-# Connect to off-chain DB.
-conn = get_db_connection()
-if conn is None:
-    print("Abandoning this run of the bot since connection to the off-chain DB failed")
-    sys.exit(1)
+@dataclass
+class Account:
+    """
+    DataClass For Bot Account
+    """
+    address: str
+    private_key: str
 
-cursor = conn.cursor()
+class Bot:
 
+    def __init__(self, account: Account, network: str, interval: int):
+        """
+        Args:
+            - account: Account object containing address and private_key
+            - network: "testnet" or "mainnet".
+            - trade: contains trade info
+            - interval: sleeping interval for bot in milliseconds
+        """
+        self.account = account
+        self.network = network
+        self.interval = interval
+        self.client = TinymanMainnetClient(user_address=account.address) if network == "mainnet" else TinymanTestnetClient(user_address=account.address)
 
-def run_bot(network: str):
-    key = mnemonic.to_private_key(os.getenv("acct_mnemonic"))
-    account = Account(os.getenv("acct_address"), key)
-    token_network = network.lower()
+    def run(self):
+        print(Fore.GREEN, "Bot Is Running ...")
+        if not self.client.is_opted_in():
+            print(Fore.GREEN, "Optin In Progress ...")
+            self._optin()
+        while True:
+            trades = get_trades(self.network, self.account.address)
+            if not trades:
+                print(Fore.RED, "No Trade To Execute")
+                break
+            for trade in trades:
+                self._execute(trade)
+            print(Fore.GREEN, f'Bot Sleeping For {self.interval} Seconds ...')
+            time.sleep(self.interval)
 
-    while (True):
-        supported_assets = get_supported_algo_assets(token_network, cursor)
-
-        if supported_assets is None:
-            print(
-                "Unable to retrieve information on supported assets. Abandoning bot run.")
-            sys.exit(1)
-
-        # Query for swaps that need to be carried out.
-        try:
-            cursor.execute("SELECT id, asset1_id, asset2_id, asset_in_id, asset_in_amt, slippage, min_price_for_sell, do_redeem, do_reverse FROM trades WHERE wallet_address=? AND token_network=? AND is_completed=?", (account.address, token_network, 0))
-        except mariadb.Error as e:
-            print(f"Error attempting to query for desired trades: {e}")
-            sys.exit(1)
-
-        # Create Tinyman client on behalf of the trading wallet address.
-        if token_network == "testnet":
-            client = TinymanTestnetClient(user_address=account.address)
+    
+    def _optin(self):
+        """
+        Opts In TinyMan App into Acount
+        """
+        transaction_group = self.client.prepare_app_optin_transactions()
+        self._submit_txn(transaction_group)
+        
+    
+    def _execute(self, trade):
+        """
+        Executes A Trade.
+        Args:
+            - trade: An Instance of Trade class in mongo db
+        """
+        t_asset1 = trade.asset1
+        t_asset2 = trade.asset2
+        t_asset_in = trade.asset_in
+        asset1 = self.client.fetch_asset(int(t_asset1.asset_id))
+        asset2 = self.client.fetch_asset(int(t_asset2.asset_id))
+        pool = self.client.fetch_pool(asset1, asset2)
+        if t_asset_in.asset_id != t_asset2.asset_id:
+            quote = pool.fetch_fixed_input_swap_quote(
+                    asset1(trade.asset_in_amt*10**asset1.decimals), float(trade.slippage))
         else:
-            client = TinymanMainnetClient(user_address=account.address)
+            quote = pool.fetch_fixed_input_swap_quote(
+                    asset2(trade.asset_in_amt*10**asset2.decimals), float(trade.slippage))
+        amt_in = quote.amount_in_with_slippage
+        amt_out = quote.amount_out_with_slippage
+        amt_in = amt_in.amount/10**amt_in.asset.decimals
+        amt_out = amt_out.amount/10**amt_out.asset.decimals
+        price = amt_out/amt_in
+        if price >= float(trade.min_sell_price):
+            self._create_swap_txn(quote, pool)
+            if trade.do_redeem:
+                self._redeem(pool, t_asset_in, t_asset2, t_asset1)
+            trade.is_completed = True
+            trade.save()
+        else:
+            print(Fore.RED, f"Price Target Not Reached, Moving To The Next Trade...")
+        
 
-        # Check if the account is opted into Tinyman and optin if necessary.
-        if (not client.is_opted_in()):
-            print('Account not opted into app, opting in now..')
-            transaction_group = client.prepare_app_optin_transactions()
-            transaction_group.sign_with_private_key(
-                account.address, account.private_key)
-            result = client.submit(transaction_group, wait=True)
-
-        # Declare two lists that will be used to keep track of the trades that are completed
-        # in this run and the reverse trades that are to be setup, if any.
-        swaps_completed = []
-        reverse_trades = []
-
-        # Loop through the swaps to be carried out.
-        for (id, asset1_id, asset2_id, asset_in_id, asset_in_amt, slippage, min_price_for_sell, do_redeem, do_reverse) in cursor:
-            # Fetch the assets of interest.
-            asset1 = client.fetch_asset(
-                supported_assets[asset1_id].token_asset_id)
-            asset2 = client.fetch_asset(
-                supported_assets[asset2_id].token_asset_id)
-
-            # Fetch the pool we will work with.
-            pool = client.fetch_pool(asset1, asset2)
-
-            # Get a quote for a swap of 10 asset_in to asset_out with the configured slippage tolerance.
-            if asset_in_id != asset2_id:
-                quote = pool.fetch_fixed_input_swap_quote(
-                    asset1(asset_in_amt), float(slippage))
-                print(quote)
-                print(
-                    f'{supported_assets[asset2_id].token_code} per {supported_assets[asset1_id].token_code}: {quote.price}')
-                print(
-                    f'{supported_assets[asset2_id].token_code} per {supported_assets[asset1_id].token_code} (worst case): {quote.price_with_slippage}')
-            else:
-                quote = pool.fetch_fixed_input_swap_quote(
-                    asset2(asset_in_amt), float(slippage))
-                print(quote)
-                print(
-                    f'{supported_assets[asset1_id].token_code} per {supported_assets[asset2_id].token_code}: {quote.price}')
-                print(
-                    f'{supported_assets[asset1_id].token_code} per {supported_assets[asset2_id].token_code} (worst case): {quote.price_with_slippage}')
-
-            # We only want to sell if asset_in unit price is > min_price_for_sell asset_out.
-            if quote.price_with_slippage > float(min_price_for_sell):
-                total_asset_out_received = quote.amount_out_with_slippage.amount
-                print(
-                    f'Swapping {quote.amount_in} to {quote.amount_out_with_slippage}')
-
-                # Prepare a transaction group.
-                transaction_group = pool.prepare_swap_transactions_from_quote(
-                    quote)
-
-                # Sign the group with the wallet's key.
-                transaction_group.sign_with_private_key(
-                    account.address, account.private_key)
-
-                # Submit transactions to the network and wait for confirmation.
-                result = client.submit(transaction_group, wait=True)
-
-                # Check if any excess remains after the swap.
-                excess = pool.fetch_excess_amounts()
-                if asset_in_id != asset2_id:
-                    if asset2 in excess:
-                        amount = excess[asset2]
-                        total_asset_out_received += amount.amount
-                        print(f'Excess: {amount}')
-
-                        if do_redeem != 0:
-                            transaction_group = pool.prepare_redeem_transactions(
-                                amount)
-                            transaction_group.sign_with_private_key(
-                                account.address, account.private_key)
-                            result = client.submit(
-                                transaction_group, wait=True)
-                        else:
-                            print(
-                                f'Excess {supported_assets[asset2_id].token_code} remains from the trade but the configuration is set to ignore redeeming the excess at this time.')
-                else:
-                    if asset1 in excess:
-                        amount = excess[asset1]
-                        total_asset_out_received += amount.amount
-                        print(f'Excess: {amount}')
-
-                        if do_redeem != 0:
-                            transaction_group = pool.prepare_redeem_transactions(
-                                amount)
-                            transaction_group.sign_with_private_key(
-                                account.address, account.private_key)
-                            result = client.submit(
-                                transaction_group, wait=True)
-                        else:
-                            print(
-                                f'Excess {supported_assets[asset1_id].token_code} remains from the trade but the configuration is set to ignore redeeming the excess at this time.')
-
-                # Swap will be marked as completed in the off-chain DB.
-                swaps_completed.append(int(id))
-
-                if do_reverse != 0:
-                    if int(supported_assets[asset_in_id].token_asset_id) == 0:
-                        asset_in_amt = int(asset_in_amt) + 14000
-                        reverse_min_price = (float(asset_in_amt) / float(total_asset_out_received)) + float(
-                            os.getenv("reverse_trade_min_profit_margin"))
-                    else:
-                        reverse_min_price = (float(asset_in_amt) / float(total_asset_out_received + 14000)) + float(
-                            os.getenv("reverse_trade_min_profit_margin"))
-
-                    reverse_trades.append((account.address, asset2_id, asset1_id, asset2_id, total_asset_out_received, float(
-                        slippage), reverse_min_price, 0, 0, 0, token_network))
-
-        # Update completed flag for the completed swaps.
-        for swap_id in swaps_completed:
-            cursor.execute(
-                "UPDATE trades SET is_completed=1 WHERE id=?", (swap_id,))
-
-        # Setup reverse trades.
-        for trade in reverse_trades:
-            cursor.execute("INSERT INTO trades (wallet_address, asset1_id, asset2_id, asset_in_id, asset_in_amt, slippage, min_price_for_sell, do_redeem, is_completed, do_reverse, token_network) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", trade)
-
-        time.sleep(float(os.getenv("bot_interval")))
+    
+    def _create_swap_txn(self, quote, pool):
+        transaction_group = pool.prepare_swap_transactions_from_quote(quote)
+        self._submit_txn(transaction_group)
+    
+    def _redeem(self, pool, asset_in, asset2, asset1):
+        excess = pool.fetch_excess_amounts()
+        if asset_in.asset_id != asset2.asset_id:
+            if asset2 in excess:
+                self._submit_redeem(asset2, excess, pool)
+                
+        else:
+            if asset1 in excess:
+                self._submit_redeem(asset1, excess, pool)
+    
+    def _submit_redeem(self, asset, excess, pool):
+        amount = excess[asset]
+        transaction_group = pool.prepare_redeem_transactions(amount)
+        self._submit_txn(transaction_group)
+    
+    def _submit_txn(self, txn):
+        txn.sign_with_private_key(
+            self.account.address, self.account.private_key)
+        self.client.submit(txn, wait=True)
+                
+    
